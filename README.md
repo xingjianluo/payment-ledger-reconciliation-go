@@ -9,7 +9,7 @@
 internal/domain/      账务领域模型：账户、凭证、分录、幂等记录、业务错误类型
 internal/store/       内存存储（map + 有序流水），含仅供测试的故障注入方法
 internal/ledger/      账本核心服务：转账、冲正、幂等判定、串行化过账
-internal/reconcile/   对账器：凭证/流水/余额三方核对与差异分类
+internal/reconcile/   对账器：账本内部核对（reconcile.go）+ 渠道双边核对（channel.go）
 cmd/ledgerdemo/       本地可运行的端到端演示
 ```
 
@@ -88,6 +88,66 @@ cmd/ledgerdemo/       本地可运行的端到端演示
 `kind / account_id / voucher_id / request_id / expected / actual / evidence`，
 `Report.CountByKind` 提供按类型的计数。
 
+## 渠道对账（双边核对）
+
+`Reconciler.ReconcileWithChannel(ctx, from, to, txns, opts)` 在账本自身核对的基础上，
+把**渠道对账单**（`[]ChannelTxn`，本地构造即可，不需要连任何外部系统、网络或真实凭据）
+与窗口内账本凭证按**业务请求标识（RequestID）**双边配对。
+
+渠道明细字段：`ChannelTxnID`（渠道流水号）、`RequestID`（业务请求标识）、
+`Amount`、`Direction`（`DEBIT` 支出 / `CREDIT` 收入）、
+`Status`（`SUCCESS / FAILED / PENDING`）、`OccurredAt`（UnixNano）。
+
+**方向映射约定**（账本 → 渠道视角）：`TRANSFER` 凭证 ↔ `DEBIT`，
+`REVERSAL`（冲正/退款回流）凭证 ↔ `CREDIT`。
+
+**配对结论分四类，互不混合、每个 RequestID 只落一类**：
+
+| 类别 | 含义 | 判定依据 |
+|---|---|---|
+| `LEDGER_ONLY` | 账本有而渠道没有（渠道未达/漏记） | 账本凭证号、金额、方向、时间 |
+| `CHANNEL_ONLY` | 渠道有而账本没有（渠道多记/未入账） | 渠道流水号、金额、方向、时间 |
+| `CONTENT_MISMATCH` | 两边都有但金额或方向对不上 | 双边金额/方向/时间并列 |
+| `CHANNEL_DUPLICATE` | 渠道自身重复：同一 RequestID 多条且内容不一致 | 全部冲突渠道流水号与内容指纹 |
+
+每条 `ChannelDiff` 都带 RequestID 与双边的金额、方向、时间等判定依据，
+`ChannelReport.CountByKind` 按类型计数，`Matched` 给出双边一致笔数。
+
+**口径与原有核对完全兼容**：
+
+- 同一时间窗口 `[from, to)`：半开区间，边界只算一次，账本侧（凭证创建时间）
+  与渠道侧（发生时间）用同一套过滤规则；
+- `ChannelReport.Internal` 完整保留同一窗口、同一快照下的账本自身核对结论
+  （凭证/流水/余额六类差异），两份结论互不影响；
+- 只读：在 `ledger.Service.View` 内调用即获得快照一致性——并发入账时
+  报告基于同一时点，不会看到只写了一半的凭证或流水；
+- 幂等：对账不改动任何账本数据，同一份对账单重复导入/重跑结论完全一致；
+  内容完全相同的渠道重复记录会被折叠（视为重发），不重复计数；
+- 渠道侧 `FAILED / PENDING` 记录本身不构成差异（失败单本就不应有账），
+  但不静默丢弃：计入 `SkippedChannelNonSuccess` 如实披露；
+- 无 RequestID 的渠道记录无法配对，逐条记为 `CHANNEL_ONLY`，不合并、不丢弃。
+
+**本地构造渠道数据并验证**：
+
+```go
+statement := []reconcile.ChannelTxn{
+    {ChannelTxnID: "CH-1", RequestID: "T-1", Amount: 300,
+     Direction: reconcile.ChannelDebit, Status: reconcile.ChannelSuccess,
+     OccurredAt: time.Now().UnixNano()},
+}
+var rep reconcile.ChannelReport
+err := svc.View(ctx, func(ctx context.Context) error {
+    var e error
+    rep, e = rec.ReconcileWithChannel(ctx, from, to, statement,
+        &reconcile.Options{OpeningBalances: opening})
+    return e
+})
+// rep.Balanced / rep.Matched / rep.CountByKind / rep.ChannelDiffs / rep.Internal
+```
+
+`go run ./cmd/ledgerdemo` 的第 6 步演示了完整流程：构造一份含
+「一致记录 + 渠道多记 + 渠道自身重复 + 失败单」的对账单并输出配对结论。
+
 ## 失败原因一览（FailureKind）
 
 `IDEMPOTENT_CONTENT_MISMATCH`、`ACCOUNT_NOT_FOUND`、`ACCOUNT_INACTIVE`、
@@ -115,7 +175,11 @@ go test ./... -race -count=1 -v
 - 余额不足、账户冻结：零流水、零余额变更（无部分入账），且失败结论可重放；
 - 冲正与原始凭证可追溯、净效果为零、重复冲正被拒；
 - 对账差异六类：缺账、重复、金额不符、有账无凭、借贷不守恒、余额不符，
-  以及时间窗口过滤与干净账本零差异。
+  以及时间窗口过滤与干净账本零差异；
+- 渠道对账：双边完全一致、账本单边、渠道单边、金额/方向对不上、
+  渠道自身重复与相同记录折叠、窗口边界只算一次、重复导入/重跑幂等、
+  非成功状态计数披露、冲正按 CREDIT 配对、并发写入下快照一致（-race）、
+  5000 条渠道明细的大对账单性能。
 
 ## 范围与限制
 
