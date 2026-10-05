@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/xingjianluo/payment-ledger-reconciliation-go/internal/channelrecon"
 	"github.com/xingjianluo/payment-ledger-reconciliation-go/internal/domain"
 	"github.com/xingjianluo/payment-ledger-reconciliation-go/internal/ledger"
 	"github.com/xingjianluo/payment-ledger-reconciliation-go/internal/reconcile"
@@ -66,6 +68,31 @@ func main() {
 	}))
 	fmt.Printf("reconcile balanced=%v diffs=%d\n", report.Balanced, len(report.Diffs))
 	fmt.Printf("balances: A=%d B=%d\n", balance(svc, "A"), balance(svc, "B"))
+
+	// 6) 渠道对账：本地 CSV 构造渠道对账单，与账本双边核对（只读）。
+	csvText := "channel_txn_id,request_id,direction,amount,occurred_at,status\n" +
+		fmt.Sprintf("CH-1,T-1,DEBIT,300,%d,SUCCESS\n", time.Now().UnixNano()) +   // 与账本一致
+		fmt.Sprintf("CH-2,RV-1,CREDIT,300,%d,SUCCESS\n", time.Now().UnixNano()) + // 冲正：渠道视角为入金
+		fmt.Sprintf("CH-3,T-GHOST,DEBIT,88,%d,SUCCESS\n", time.Now().UnixNano())  // 渠道有、账本没有
+	txns, err := channelrecon.ParseCSV(strings.NewReader(csvText))
+	must(err)
+	stmt := channelrecon.NewStatement()
+	fmt.Printf("statement imported=%d (re-import adds %d)\n", stmt.Import(txns), stmt.Import(txns))
+
+	crec := channelrecon.NewReconciler(st)
+	var crep channelrecon.Report
+	must(svc.View(ctx, func(ctx context.Context) error {
+		var err error
+		crep, err = crec.Reconcile(ctx, stmt, from, to, &reconcile.Options{OpeningBalances: opening})
+		return err
+	}))
+	fmt.Printf("channel reconcile balanced=%v matched=%d ledger_txns=%d channel_txns=%d\n",
+		crep.Balanced, crep.Matched, crep.LedgerTxns, crep.ChannelTxns)
+	fmt.Printf("internal reconcile preserved: balanced=%v diffs=%d\n",
+		crep.Internal.Balanced, len(crep.Internal.Diffs))
+	for _, d := range crep.Diffs {
+		fmt.Println("  " + d.String())
+	}
 }
 
 func openAccount(svc *ledger.Service, id, name string, bal int64) error {

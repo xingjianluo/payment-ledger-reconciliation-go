@@ -6,11 +6,12 @@
 ## 目录结构
 
 ```
-internal/domain/      账务领域模型：账户、凭证、分录、幂等记录、业务错误类型
-internal/store/       内存存储（map + 有序流水），含仅供测试的故障注入方法
-internal/ledger/      账本核心服务：转账、冲正、幂等判定、串行化过账
-internal/reconcile/   对账器：凭证/流水/余额三方核对与差异分类
-cmd/ledgerdemo/       本地可运行的端到端演示
+internal/domain/        账务领域模型：账户、凭证、分录、幂等记录、业务错误类型
+internal/store/         内存存储（map + 有序流水），含仅供测试的故障注入方法
+internal/ledger/        账本核心服务：转账、冲正、幂等判定、串行化过账
+internal/reconcile/     对账器：凭证/流水/余额三方核对与差异分类
+internal/channelrecon/  渠道对账：对账单导入（CSV）、双边配对与差异分类
+cmd/ledgerdemo/         本地可运行的端到端演示
 ```
 
 ## 账务模型
@@ -88,6 +89,66 @@ cmd/ledgerdemo/       本地可运行的端到端演示
 `kind / account_id / voucher_id / request_id / expected / actual / evidence`，
 `Report.CountByKind` 提供按类型的计数。
 
+## 渠道对账（账本 ↔ 渠道对账单）
+
+`channelrecon` 包在账本自身核对之上增加「拿渠道对账单来跟账本对」的双边核对，
+全程本地完成：不连外部系统、不需要网络或真实凭据。
+
+**渠道数据模型（ChannelTxn）**：每笔渠道明细带
+`渠道流水号 / 业务请求标识(RequestID) / 方向 / 金额 / 发生时间 / 状态`。
+方向为渠道视角：`DEBIT`=支付出金、`CREDIT`=退款入金；仅 `SUCCESS` 状态参与配对，
+其它状态在报告中以 `SkippedChannel` 计数（不静默丢弃）。
+
+**导入与构造**：
+
+```go
+txns, _ := channelrecon.ParseCSV(csvReader) // 本地 CSV，列见下
+stmt := channelrecon.NewStatement()
+stmt.Import(txns)                           // 可分批；重复导入自动去重
+```
+
+CSV 列为 `channel_txn_id,request_id,direction,amount,occurred_at,status`，
+`occurred_at` 支持 UnixNano 整数或 RFC3339。导入按「流水号 + 内容指纹」去重：
+同一份对账单重复导入/重跑不会把差异重复计数；同一流水号但内容不同的记录
+不丢弃，会在配对时以渠道侧重复的形式暴露。
+
+**双边核对**：
+
+```go
+crec := channelrecon.NewReconciler(st)
+var rep channelrecon.Report
+svc.View(ctx, func(ctx context.Context) error { // 读锁快照，与并发入账互斥
+    var err error
+    rep, err = crec.Reconcile(ctx, stmt, from, to, &reconcile.Options{OpeningBalances: opening})
+    return err
+})
+```
+
+- 先完整执行原有账本自身核对，结论原样保留在 `Report.Internal`；
+  再按 **RequestID** 把窗口内账本凭证与渠道明细配对，差异各自成类：
+
+  | 类别 | 含义 |
+  |---|---|
+  | `LEDGER_ONLY` | 账本有、渠道没有（渠道未达/漏记） |
+  | `CHANNEL_ONLY` | 渠道有、账本没有（渠道多记/账本未入账；若凭证在窗口外会注明） |
+  | `FIELD_MISMATCH` | 两边都有但金额或方向对不上（TRANSFER↔DEBIT、REVERSAL↔CREDIT） |
+  | `CHANNEL_DUPLICATE` | 渠道自身重复：同一 RequestID 多条明细（证据注明内容是否一致） |
+
+  每条 `ChannelDiff` 都带 RequestID，并同时带出账本侧与渠道侧各自的金额、
+  时间与凭证号/渠道流水号作为判定依据；`Report.CountByKind` 按类型计数，
+  各类不混淆、不静默忽略；重复组不再参与配对，避免一笔业务被重复计数。
+
+**与原有核对口径的兼容范围**：
+
+- 时间窗口同为 `[from, to)` 左闭右开：边界上的渠道明细只计入一个窗口，
+  相邻窗口既不重复也不遗漏；账本侧沿用凭证创建时间，渠道侧用明细发生时间。
+- 余额核对口径（`Options.OpeningBalances` / 全量重算）与内部核对完全一致，
+  结论见 `Report.Internal`。
+- 整个过程只读：在 `ledger.Service.View` 读锁快照内执行，并发入账时报告
+  基于同一个一致时点，不会看到只写了一半的凭证或流水。
+- 配对按 RequestID 归组 + 哈希表匹配，几千条渠道明细可在线性时间内完成
+  （测试覆盖 5000 条，约百毫秒级）。
+
 ## 失败原因一览（FailureKind）
 
 `IDEMPOTENT_CONTENT_MISMATCH`、`ACCOUNT_NOT_FOUND`、`ACCOUNT_INACTIVE`、
@@ -115,7 +176,11 @@ go test ./... -race -count=1 -v
 - 余额不足、账户冻结：零流水、零余额变更（无部分入账），且失败结论可重放；
 - 冲正与原始凭证可追溯、净效果为零、重复冲正被拒；
 - 对账差异六类：缺账、重复、金额不符、有账无凭、借贷不守恒、余额不符，
-  以及时间窗口过滤与干净账本零差异。
+  以及时间窗口过滤与干净账本零差异；
+- 渠道对账：全部配对成功并保留内部核对结论、账本有渠道没有、渠道有账本没有
+  （含凭证落在窗口外的证据）、金额/方向对不上、渠道自身重复（内容一致与不一致）、
+  非成功状态计数、窗口边界只算一次、对账单重复导入与重跑去重、
+  并发入账下快照一致（-race）、5000 条渠道明细性能、CSV 解析与端到端核对。
 
 ## 范围与限制
 
